@@ -3,3 +3,12 @@ build
 cscope.out
 tags
 lib/*.gcov
+
+# Local/agent/editor noise
+.pi/
+*.swp
+*.swo
+*.swn
+*~
+.DS_Store
+*.tmp
