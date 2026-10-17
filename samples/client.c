@@ -641,7 +641,7 @@ write_migr_data(int sock, void *buf, size_t len)
     pthread_mutex_lock(&mutex);
     ssize_t ret = tran_sock_msg_iovec(sock, msg_id--, VFIO_USER_MIG_DATA_WRITE,
                                       send_iovecs, 3, NULL, 0, NULL,
-                                      &req, sizeof(req), NULL, 0);
+                                      NULL, 0, NULL, 0);
     pthread_mutex_unlock(&mutex);
 
     return ret;
@@ -1451,6 +1451,7 @@ int main(int argc, char *argv[])
     free(dma_regions);
     free(dirty_pages);
 
+    printf("client: migration and destination DMA completed\n");
     return 0;
 }
 

@@ -156,7 +156,10 @@ def test_dma_map_reply_fail(mock_dma_register, mock_quiesce, mock_reset):
                VFIO_USER_F_DMA_REGION_WRITE),
         offset=0, addr=0x10 << PAGE_SHIFT, size=PAGE_SIZE)
 
-    msg(ctx, client.sock, VFIO_USER_DMA_MAP, payload, rsp=False)
+    send_msg(client.sock, VFIO_USER_DMA_MAP, VFIO_USER_F_TYPE_COMMAND, payload)
+    # The synchronous caller must reattach after the failed reply resets the
+    # transport, rather than mistaking successful reset for a live connection.
+    vfu_run_ctx(ctx, expect=errno.ENOTCONN)
 
     vfu_run_ctx(ctx, errno.ENOTCONN)
 

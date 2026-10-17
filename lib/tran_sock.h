@@ -63,8 +63,12 @@ tran_sock_send(int sock, uint16_t msg_id, bool is_reply,
 
 /*
  * Receive a message from the other end, and place the data into the given
- * buffer. If data is supplied by the other end, it must be exactly *len in
- * size.
+ * buffer. If a nonempty body is supplied, it must contain at least *len bytes.
+ * For commands only that prefix is read; the caller must consume any remaining
+ * body bytes (as indicated by hdr->msg_size) before receiving another header.
+ * Reply bodies must instead be exactly *len bytes. Malformed replies shut down
+ * the socket and return ECONNRESET; complete header-only error replies return
+ * the peer's errno without shutting down the connection.
  */
 int
 tran_sock_recv(int sock, struct vfio_user_header *hdr, bool is_reply,

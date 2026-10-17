@@ -44,6 +44,7 @@ python_tests = [
     'test_quiesce.py',
     'test_request_errors.py',
     'test_setup_region.py',
+    'test_socket_framing.py',
     'test_sgl_get_put.py',
     'test_sgl_read_write.py',
     'test_vfu_create_ctx.py',

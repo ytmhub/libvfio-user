@@ -1669,6 +1669,7 @@ vfu_run_ctx(vfu_ctx_t *vfu_ctx)
     int reqs_processed = 0;
     bool blocking;
     int err;
+    int poll_fd;
 
     assert(vfu_ctx != NULL);
 
@@ -1678,6 +1679,7 @@ vfu_run_ctx(vfu_ctx_t *vfu_ctx)
     }
 
     blocking = !(vfu_ctx->flags & LIBVFIO_USER_FLAG_ATTACH_NB);
+    poll_fd = vfu_get_poll_fd(vfu_ctx);
 
     do {
         vfu_msg_t *msg;
@@ -1713,6 +1715,12 @@ vfu_run_ctx(vfu_ctx_t *vfu_ctx)
                 err = 0;
                 break;
             }
+        }
+        /* do_reply can successfully reset/detach after a failed reply and
+         * return zero. Preserve asynchronous quiesce completion semantics,
+         * but tell this synchronous caller that it must attach again. */
+        if (err == 0 && vfu_get_poll_fd(vfu_ctx) != poll_fd) {
+            return ERROR_INT(ENOTCONN);
         }
     } while (err == 0 && blocking);
 

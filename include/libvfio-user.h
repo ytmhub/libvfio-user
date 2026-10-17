@@ -84,7 +84,11 @@ dma_sg_size(void);
  *
  * This also applies to vfu_run_ctx(). However, it's presumed that any actual
  * reads or writes of the socket connection will not need to block, since both
- * APIS are synchronous.
+ * APIs are synchronous. The socket transport bounds incomplete-frame receives
+ * and response sends with absolute 250 ms deadlines (separately). Thus idle
+ * polling is nonblocking, but attach/request processing can wait for a partial
+ * frame. Failed framing disconnects the peer, rather than retaining partial
+ * input for retry. See docs/socket-transport.md for the compatibility policy.
  */
 #define LIBVFIO_USER_FLAG_ATTACH_NB  (1 << 0)
 

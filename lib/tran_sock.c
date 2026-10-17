@@ -38,8 +38,10 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <time.h>
 
 #include "tran_sock.h"
 
@@ -47,7 +49,54 @@ typedef struct {
     int listen_fd;
     int conn_fd;
     int client_cmd_socket_fd;
+    int64_t request_deadline;
+    bool poisoned;
 } tran_sock_t;
+
+/* A compatibility bound, not a wire-protocol or device-platform constant. */
+#define FRAME_TIMEOUT_MS 250
+
+static int64_t
+monotonic_ms(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        abort();
+    }
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+/* Poison a possibly partial frame. Never let its remainder become a header. */
+static int
+disconnect_socket(int fd)
+{
+    (void)shutdown(fd, SHUT_RDWR);
+    return ERROR_INT(ECONNRESET);
+}
+
+static int
+wait_socket(int fd, short events, int64_t deadline)
+{
+    struct pollfd pfd = { .fd = fd, .events = events };
+    int ret;
+
+    for (;;) {
+        int64_t remaining = deadline - monotonic_ms();
+
+        if (remaining <= 0) {
+            return disconnect_socket(fd);
+        }
+        ret = poll(&pfd, 1, remaining);
+        if (ret > 0) {
+            return 0; /* recv/send reports EOF or the precise socket error. */
+        }
+        if (ret < 0 && errno == EINTR) {
+            continue;
+        }
+        return disconnect_socket(fd);
+    }
+}
 
 int
 tran_sock_send_iovec(int sock, uint16_t msg_id, bool is_reply,
@@ -61,6 +110,8 @@ tran_sock_send_iovec(int sock, uint16_t msg_id, bool is_reply,
     size_t i;
     size_t size = count * sizeof(*fds);
     char *buf;
+    struct iovec *pending;
+    int64_t deadline = monotonic_ms() + FRAME_TIMEOUT_MS;
 
     if (nr_iovecs == 0) {
         iovecs = alloca(sizeof(*iovecs));
@@ -109,19 +160,52 @@ tran_sock_send_iovec(int sock, uint16_t msg_id, bool is_reply,
         memcpy(CMSG_DATA(cmsg), fds, size);
     }
 
-    ret = sendmsg(sock, &msg, MSG_NOSIGNAL);
-
-    if (ret == -1) {
-        /* Treat a failed write due to EPIPE the same as a short write. */
-        if (errno == EPIPE) {
-            return ERROR_INT(ECONNRESET);
-        }
+    /* Work on a copy: advancing a partial write must not mutate caller iovecs. */
+    pending = calloc(nr_iovecs, sizeof(*pending));
+    if (pending == NULL) {
         return -1;
-    } else if ((size_t)ret < hdr.msg_size) {
-        return ERROR_INT(ECONNRESET);
     }
+    memcpy(pending, iovecs, nr_iovecs * sizeof(*pending));
+    msg.msg_iov = pending;
 
+    while (msg.msg_iovlen != 0) {
+        if (monotonic_ms() >= deadline) {
+            goto disconnected;
+        }
+        ret = sendmsg(sock, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
+                wait_socket(sock, POLLOUT, deadline) == 0) {
+                continue;
+            }
+            goto disconnected;
+        }
+        if (ret == 0) {
+            goto disconnected;
+        }
+        /* SCM_RIGHTS belongs to the first successfully sent byte only. */
+        msg.msg_control = NULL;
+        msg.msg_controllen = 0;
+        while (msg.msg_iovlen != 0 &&
+               (size_t)ret >= msg.msg_iov[0].iov_len) {
+            ret -= msg.msg_iov[0].iov_len;
+            msg.msg_iov++;
+            msg.msg_iovlen--;
+        }
+        if (msg.msg_iovlen != 0) {
+            msg.msg_iov[0].iov_base = (char *)msg.msg_iov[0].iov_base + ret;
+            msg.msg_iov[0].iov_len -= ret;
+        }
+    }
+    free(pending);
     return 0;
+
+disconnected:
+    free(pending);
+    return disconnect_socket(sock);
 }
 
 int
@@ -142,52 +226,91 @@ tran_sock_send(int sock, uint16_t msg_id, bool is_reply,
 
 static int
 get_msg(void *data, size_t len, int *fds, size_t *nr_fds, int sock_fd,
-        int sock_flags)
+        int sock_flags, int64_t deadline)
 {
     int ret;
-    struct iovec iov = {.iov_base = data, .iov_len = len};
-    struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1};
-    struct cmsghdr *cmsg;
+    size_t capacity = nr_fds == NULL ? 0 : *nr_fds;
+    size_t received = 0, done = 0;
+    /* Fixed protocol limit also bounds stack use for untrusted ancillary data. */
+    union {
+        struct cmsghdr align;
+        char bytes[CMSG_SPACE(sizeof(int) * VFIO_USER_CLIENT_MAX_MSG_FDS_LIMIT)];
+    } control;
 
-    if (nr_fds != NULL && *nr_fds > 0) {
-        assert(fds != NULL);
-        msg.msg_controllen = CMSG_SPACE(sizeof(int) * *nr_fds);
-        msg.msg_control = alloca(msg.msg_controllen);
+    if (nr_fds != NULL) {
         *nr_fds = 0;
     }
 
-    ret = recvmsg(sock_fd, &msg, sock_flags);
-    if (ret == -1) {
-        return -1;
-    } else if (ret == 0) {
-        return ERROR_INT(ENOMSG);
-    } else if ((size_t)ret < len) {
-        return ERROR_INT(ECONNRESET);
-    }
+    while (done < len) {
+        struct iovec iov = { .iov_base = (char *)data + done,
+                             .iov_len = len - done };
+        struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1,
+                             .msg_control = &control,
+                             .msg_controllen = sizeof(control) };
+        struct cmsghdr *cmsg;
+        bool invalid = false;
 
-    if (msg.msg_flags & MSG_CTRUNC || msg.msg_flags & MSG_TRUNC) {
-        return ERROR_INT(EFAULT);
-    }
-
-    if (nr_fds != NULL) {
+        if (monotonic_ms() >= deadline) {
+            goto disconnected;
+        }
+        ret = recvmsg(sock_fd, &msg, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
+        if (ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                goto disconnected;
+            }
+            /* Preserve the public idle nonblocking poll contract. */
+            if (done == 0 && (sock_flags & MSG_DONTWAIT)) {
+                return -1;
+            }
+            if (wait_socket(sock_fd, POLLIN, deadline) < 0) {
+                goto disconnected;
+            }
+            continue;
+        }
+        if (ret == 0) {
+            goto disconnected;
+        }
+        /* Parse even truncated/short messages: already delivered FDs are ours. */
         for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
             if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
                 continue;
             }
-            if (cmsg->cmsg_len < CMSG_LEN(sizeof(int))) {
-                return ERROR_INT(EINVAL);
-            }
-            int size = cmsg->cmsg_len - CMSG_LEN(0);
-            if (size % sizeof(int) != 0) {
-                return ERROR_INT(EINVAL);
-            }
-            *nr_fds = (int)(size / sizeof(int));
-            memcpy(fds, CMSG_DATA(cmsg), *nr_fds * sizeof(int));
-            break;
-        }
-    }
+            size_t size = cmsg->cmsg_len - CMSG_LEN(0);
+            size_t i;
 
-    return ret;
+            if (size % sizeof(int) != 0 || size == 0) {
+                invalid = true;
+            }
+            for (i = 0; i < size / sizeof(int); i++) {
+                int fd;
+
+                memcpy(&fd, (char *)CMSG_DATA(cmsg) + i * sizeof(fd), sizeof(fd));
+                if (received < capacity) {
+                    fds[received++] = fd;
+                } else {
+                    close(fd);
+                    invalid = true;
+                }
+            }
+        }
+        if (invalid || (msg.msg_flags & (MSG_CTRUNC | MSG_TRUNC))) {
+            goto disconnected;
+        }
+        done += ret;
+    }
+    if (nr_fds != NULL) {
+        *nr_fds = received;
+    }
+    return done;
+
+disconnected:
+    while (received != 0) {
+        close(fds[--received]);
+    }
+    return disconnect_socket(sock_fd);
 }
 
 /*
@@ -198,35 +321,48 @@ get_msg(void *data, size_t len, int *fds, size_t *nr_fds, int sock_fd,
 static int
 tran_sock_recv_fds(int sock, struct vfio_user_header *hdr, bool is_reply,
                    uint16_t *msg_id, void *data, size_t *len, int *fds,
-                   size_t *nr_fds)
+                   size_t *nr_fds, int64_t deadline)
 {
-    int ret;
+    int ret, error;
 
     /* FIXME if ret == -1 then fcntl can overwrite recv's errno */
 
-    ret = get_msg(hdr, sizeof(*hdr), fds, nr_fds, sock, 0);
+    ret = get_msg(hdr, sizeof(*hdr), fds, nr_fds, sock, 0, deadline);
     if (ret < 0) {
         return ret;
     }
 
     if (is_reply) {
         if (msg_id != NULL && hdr->msg_id != *msg_id) {
-            return ERROR_INT(EPROTO);
+            error = EPROTO;
+            goto malformed;
         }
 
         if ((hdr->flags & VFIO_USER_F_TYPE_MASK) != VFIO_USER_F_TYPE_REPLY) {
-            return ERROR_INT(EINVAL);
+            error = EINVAL;
+            goto malformed;
         }
 
         if (hdr->flags & VFIO_USER_F_ERROR) {
             if (hdr->error_no <= 0 || hdr->error_no > SERVER_MAX_ERROR_NO) {
                 hdr->error_no = EINVAL;
             }
-            return ERROR_INT(hdr->error_no);
+            /* A complete header-only error reply does not desynchronize I/O. */
+            if (hdr->msg_size == sizeof(*hdr)) {
+                if (nr_fds != NULL) {
+                    while (*nr_fds != 0) {
+                        close(fds[--*nr_fds]);
+                    }
+                }
+                return ERROR_INT(hdr->error_no);
+            }
+            error = hdr->error_no;
+            goto malformed;
         }
     } else {
         if ((hdr->flags & VFIO_USER_F_TYPE_MASK) != VFIO_USER_F_TYPE_COMMAND) {
-            return ERROR_INT(EINVAL);
+            error = EINVAL;
+            goto malformed;
         }
         if (msg_id != NULL) {
             *msg_id = hdr->msg_id;
@@ -234,23 +370,52 @@ tran_sock_recv_fds(int sock, struct vfio_user_header *hdr, bool is_reply,
     }
 
     if (hdr->msg_size < sizeof(*hdr) || hdr->msg_size > SERVER_MAX_MSG_SIZE) {
-        return ERROR_INT(EINVAL);
+        error = EINVAL;
+        goto malformed;
+    }
+
+    /* Replies are complete exchanges, including zero-length bodies. A header
+     * claiming success cannot omit the body expected by the DMA caller. */
+    if (is_reply && len != NULL && hdr->msg_size - sizeof(*hdr) != *len) {
+        error = EINVAL;
+        goto malformed;
     }
 
     if (len != NULL && *len > 0 && hdr->msg_size > sizeof(*hdr)) {
-        ret = recv(sock, data, MIN(hdr->msg_size - sizeof(*hdr), *len),
-                   MSG_WAITALL);
+        /* Internal callers may deliberately receive a fixed body prefix, then
+         * consume the remaining payload themselves (e.g. sample DMA writes). */
+        if (hdr->msg_size - sizeof(*hdr) < *len) {
+            error = EINVAL;
+            goto malformed;
+        }
+        ret = get_msg(data, MIN(hdr->msg_size - sizeof(*hdr), *len),
+                      NULL, NULL, sock, 0, deadline);
         if (ret < 0) {
-            return -1;
+            error = errno;
+            goto malformed;
         } else if (ret == 0) {
-            return ERROR_INT(ENOMSG);
+            error = ENOMSG;
+            goto malformed;
         } else if (*len != (size_t)ret) {
-            return ERROR_INT(ECONNRESET);
+            error = ECONNRESET;
+            goto malformed;
         }
         *len = ret;
     }
 
     return 0;
+
+malformed:
+    if (nr_fds != NULL) {
+        while (*nr_fds != 0) {
+            close(fds[--*nr_fds]);
+        }
+    }
+    (void)shutdown(sock, SHUT_RDWR);
+    /* A poisoned reply stream is a lost connection, not a peer operation
+     * error. Public DMA callers use this errno to quiesce/reset and detach
+     * both primary and twin sockets. Complete header-only errors return above. */
+    return ERROR_INT(is_reply ? ECONNRESET : error);
 }
 
 int
@@ -258,7 +423,8 @@ tran_sock_recv(int sock, struct vfio_user_header *hdr, bool is_reply,
          uint16_t *msg_id, void *data, size_t *len)
 {
     return tran_sock_recv_fds(sock, hdr, is_reply, msg_id,
-                              data, len, NULL, NULL);
+                              data, len, NULL, NULL,
+                              monotonic_ms() + FRAME_TIMEOUT_MS);
 }
 
 /*
@@ -271,8 +437,10 @@ tran_sock_recv_alloc(int sock, struct vfio_user_header *hdr, bool is_reply,
     void *data;
     size_t len;
     int ret;
+    int64_t deadline = monotonic_ms() + FRAME_TIMEOUT_MS;
 
-    ret = tran_sock_recv(sock, hdr, is_reply, msg_id, NULL, NULL);
+    ret = tran_sock_recv_fds(sock, hdr, is_reply, msg_id, NULL, NULL,
+                             NULL, NULL, deadline);
 
     if (ret != 0) {
         return ret;
@@ -292,10 +460,11 @@ tran_sock_recv_alloc(int sock, struct vfio_user_header *hdr, bool is_reply,
     data = calloc(1, len);
 
     if (data == NULL) {
-        return -1;
+        (void)shutdown(sock, SHUT_RDWR);
+        return ERROR_INT(ENOMEM);
     }
 
-    ret = recv(sock, data, len, MSG_WAITALL);
+    ret = get_msg(data, len, NULL, NULL, sock, 0, deadline);
     if (ret < 0) {
         ret = errno;
         free(data);
@@ -334,7 +503,8 @@ tran_sock_msg_iovec(int sock, uint16_t msg_id, enum vfio_user_command cmd,
         hdr = alloca(sizeof(*hdr));
     }
     return tran_sock_recv_fds(sock, hdr, true, &msg_id, recv_data, &recv_len,
-                              recv_fds, recv_fd_count);
+                              recv_fds, recv_fd_count,
+                              monotonic_ms() + FRAME_TIMEOUT_MS);
 }
 
 int
@@ -385,7 +555,7 @@ tran_sock_init(vfu_ctx_t *vfu_ctx)
     ts->conn_fd = -1;
     ts->client_cmd_socket_fd = -1;
 
-    if ((ts->listen_fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+    if ((ts->listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)) == -1) {
         ret = errno;
         goto out;
     }
@@ -463,15 +633,19 @@ tran_sock_attach(vfu_ctx_t *vfu_ctx)
         return ERROR_INT(EINVAL);
     }
 
-    ts->conn_fd = accept(ts->listen_fd, NULL, NULL);
+    ts->conn_fd = accept4(ts->listen_fd, NULL, NULL, SOCK_CLOEXEC);
     if (ts->conn_fd == -1) {
         return -1;
     }
+    ts->poisoned = false;
 
     ret = tran_negotiate(vfu_ctx, &ts->client_cmd_socket_fd);
     if (ret < 0) {
+        int saved = errno;
+
         close_safely(&ts->conn_fd);
-        return -1;
+        close_safely(&ts->client_cmd_socket_fd);
+        return ERROR_INT(saved);
     }
 
     return 0;
@@ -493,16 +667,36 @@ tran_sock_get_request_header(vfu_ctx_t *vfu_ctx, struct vfio_user_header *hdr,
         vfu_log(vfu_ctx, LOG_ERR, "%s: not connected", __func__);
         return ERROR_INT(ENOTCONN);
     }
-
-    /*
-     * TODO ideally we should set O_NONBLOCK on the fd so that the syscall is
-     * faster (?). I tried that and get short reads, so we need to store the
-     * partially received buffer somewhere and retry.
-     */
-    if (vfu_ctx->flags & LIBVFIO_USER_FLAG_ATTACH_NB) {
-        sock_flags = MSG_DONTWAIT | MSG_WAITALL;
+    if (ts->poisoned) {
+        return disconnect_socket(ts->conn_fd);
     }
-    return get_msg(hdr, sizeof(*hdr), fds, nr_fds, ts->conn_fd, sock_flags);
+
+    /* Idle polls return immediately; partial frames finish against one bound. */
+    if (vfu_ctx->flags & LIBVFIO_USER_FLAG_ATTACH_NB) {
+        sock_flags = MSG_DONTWAIT;
+    } else {
+        /* Blocking mode waits indefinitely between requests, as before. Start
+         * the shared frame deadline only when input (or EOF) becomes ready. */
+        struct pollfd pfd = { .fd = ts->conn_fd, .events = POLLIN };
+
+        if (poll(&pfd, 1, -1) < 0) {
+            return -1;
+        }
+    }
+    ts->request_deadline = monotonic_ms() + FRAME_TIMEOUT_MS;
+    int ret = get_msg(hdr, sizeof(*hdr), fds, nr_fds, ts->conn_fd,
+                      sock_flags, ts->request_deadline);
+
+    /* Preserve the error reply, but never parse unread malformed-frame bytes. */
+    if (ret >= 0 && (hdr->msg_size < sizeof(*hdr) ||
+                    hdr->msg_size > SERVER_MAX_MSG_SIZE ||
+                    (hdr->flags & VFIO_USER_F_TYPE_MASK) !=
+                        VFIO_USER_F_TYPE_COMMAND)) {
+        ts->poisoned = true;
+        /* Also wake idle polling when NO_REPLY suppresses the error reply. */
+        (void)shutdown(ts->conn_fd, SHUT_RD);
+    }
+    return ret;
 }
 
 static int
@@ -527,10 +721,11 @@ tran_sock_recv_body(vfu_ctx_t *vfu_ctx, vfu_msg_t *msg)
     msg->in.iov.iov_base = malloc(msg->in.iov.iov_len);
 
     if (msg->in.iov.iov_base == NULL) {
-        return -1;
+        return disconnect_socket(ts->conn_fd);
     }
 
-    ret = recv(ts->conn_fd, msg->in.iov.iov_base, msg->in.iov.iov_len, 0);
+    ret = get_msg(msg->in.iov.iov_base, msg->in.iov.iov_len, NULL, NULL,
+                  ts->conn_fd, 0, ts->request_deadline);
 
     if (ret < 0) {
         ret = errno;
@@ -605,6 +800,9 @@ tran_sock_reply(vfu_ctx_t *vfu_ctx, vfu_msg_t *msg, int err)
     ret = tran_sock_send_iovec(ts->conn_fd, msg->hdr.msg_id, true, msg->hdr.cmd,
                                iovecs, nr_iovecs,
                                msg->out.fds, msg->out.nr_fds, err);
+    if (ts->poisoned) {
+        (void)shutdown(ts->conn_fd, SHUT_RDWR);
+    }
 
     free(iovecs);
 

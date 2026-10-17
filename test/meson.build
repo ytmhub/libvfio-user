@@ -64,6 +64,30 @@ test(
     suite: 'unit',
 )
 
+socket_transport_tests = executable(
+    'socket_transport_tests',
+    'socket-transport-tests.c',
+    objects: libvfio_user.extract_all_objects(recursive: false),
+    c_args: common_cflags,
+    dependencies: [json_c_dep],
+    include_directories: public_include_dir + lib_include_dir,
+    install: false,
+)
+test('socket_transport_tests', socket_transport_tests, suite: 'unit', timeout: 40)
+
+# The full sample client has pre-existing migration/region-info allocation leaks.
+# Keep sanitizer leak checks enabled for transport tests; run the full sample
+# here only in the normal build (ASan functional runs can be invoked separately).
+if opt_sanitizers == 'none'
+    test(
+        'sample_migration',
+        find_program('python3'),
+        args: [files('sample-migration.py'), client, server],
+        suite: 'functional',
+        timeout: 60,
+    )
+endif
+
 btree_unit_tests = executable(
     'btree_unit_tests',
     sources: [

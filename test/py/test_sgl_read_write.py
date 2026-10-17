@@ -59,6 +59,9 @@ class DMARegionHandler:
             (ready, _, _) = select.select([sock, pipe], [], [])
             if pipe in ready:
                 break
+            # Malformed/error response framing can now close the twin socket.
+            if sock.recv(1, socket.MSG_PEEK) == b'':
+                break
 
             # Read a command from the socket and service it.
             _, msg_id, cmd, payload = get_msg_fds(sock,
@@ -81,7 +84,10 @@ class DMARegionHandler:
             send_msg(sock,
                      cmd,
                      VFIO_USER_F_TYPE_REPLY,
-                     payload=payload[:c.sizeof(access)] + data,
+                     # A failed operation has a header-only error reply. Body
+                     # corruption is covered separately by framing tests.
+                     payload=(payload[:c.sizeof(access)] + data
+                              if error_no == 0 else bytearray()),
                      msg_id=msg_id,
                      error_no=error_no)
 

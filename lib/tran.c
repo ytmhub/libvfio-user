@@ -471,8 +471,10 @@ tran_negotiate(vfu_ctx_t *vfu_ctx, int *client_cmd_socket_fdp)
 
     if (twin_socket_supported && client_cmd_socket_fdp != NULL &&
         vfu_ctx->client_max_fds > 0) {
-        if (socketpair(AF_UNIX, SOCK_STREAM, 0, client_cmd_socket_fds) == -1) {
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0,
+                       client_cmd_socket_fds) == -1) {
             vfu_log(vfu_ctx, LOG_ERR, "failed to create cmd socket: %m");
+            free(client_version);
             return -1;
         }
     }
