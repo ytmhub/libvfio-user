@@ -77,7 +77,7 @@ def test_dirty_pages_setup():
     client = connect_client(ctx)
 
     f = tempfile.TemporaryFile()
-    f.truncate(0x10 << PAGE_SHIFT)
+    f.truncate(0x20 << PAGE_SHIFT)
 
     payload = vfio_user_dma_map(argsz=len(vfio_user_dma_map()),
         flags=(VFIO_USER_F_DMA_REGION_READ | VFIO_USER_F_DMA_REGION_WRITE),

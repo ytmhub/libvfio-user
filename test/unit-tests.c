@@ -426,6 +426,162 @@ test_dma_controller_add_region_twice(void **state UNUSED)
 }
 
 static void
+test_dma_controller_add_region_backing_extents(void **state UNUSED)
+{
+    const enum region_access_mode modes[] = {
+        REGION_ACCESS_MODE_MMAP,
+        REGION_ACCESS_MODE_FILE_IO,
+    };
+    const struct {
+        off_t offset;
+        uint64_t size;
+    } invalid[] = {
+        { -1, 1 },
+        { 0x1000, 1 },
+        { 0xfff, 2 },
+        { INT64_MAX, 1 },
+    };
+    char template[] = "libvfio_user_unit_tests_dma_extent_XXXXXX";
+    size_t i, j;
+    int backing_fd;
+
+    backing_fd = mkstemp(template);
+    assert_int_not_equal(-1, backing_fd);
+    assert_int_equal(0, unlink(template));
+    assert_int_equal(0, ftruncate(backing_fd, 0x1000));
+
+    for (i = 0; i < ARRAY_SIZE(modes); i++) {
+        for (j = 0; j < ARRAY_SIZE(invalid); j++) {
+            dma_memory_region_t *region;
+            dma_sg_t sg;
+            int fd = dup(backing_fd);
+
+            assert_int_not_equal(-1, fd);
+            errno = 0;
+            region = dma_controller_add_region(
+                vfu_ctx.dma, (void *)0x1000, invalid[j].size, &fd,
+                invalid[j].offset, PROT_READ | PROT_WRITE, modes[i]);
+            assert_null(region);
+            assert_int_equal(EINVAL, errno);
+            assert_int_not_equal(-1, fd);
+            assert_int_equal(0, btree_size(&vfu_ctx.dma->regions));
+
+            errno = 0;
+            assert_int_equal(-1, dma_addr_to_sgl(vfu_ctx.dma,
+                                                  (void *)0x1000, 1,
+                                                  &sg, 1, PROT_READ));
+            assert_int_equal(ENOENT, errno);
+            assert_int_equal(0, close(fd));
+        }
+    }
+
+    assert_int_equal(0, close(backing_fd));
+}
+
+static void
+test_dma_controller_add_region_backing_access(void **state UNUSED)
+{
+    const enum region_access_mode modes[] = {
+        REGION_ACCESS_MODE_MMAP,
+        REGION_ACCESS_MODE_FILE_IO,
+    };
+    const unsigned char written[] = { 0xde, 0xad, 0xbe, 0xef };
+    unsigned char readback[sizeof(written)];
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(modes); i++) {
+        char template[] = "libvfio_user_unit_tests_dma_access_XXXXXX";
+        vfu_dma_addr_t dma_addr = (void *)(0x1000 + i * 0x2000);
+        dma_memory_region_t *region;
+        dma_sg_t sg;
+        int fd = mkstemp(template);
+
+        assert_int_not_equal(-1, fd);
+        assert_int_equal(0, unlink(template));
+        assert_int_equal(0, ftruncate(fd, 0x1000));
+
+        region = dma_controller_add_region(vfu_ctx.dma, dma_addr, 0x1000,
+                                           &fd, 0, PROT_READ | PROT_WRITE,
+                                           modes[i]);
+        assert_non_null(region);
+        assert_int_equal(-1, fd);
+        assert_int_equal(1, dma_addr_to_sgl(vfu_ctx.dma, dma_addr + 0x40,
+                                            sizeof(written), &sg, 1,
+                                            PROT_READ | PROT_WRITE));
+        assert_int_equal(0, vfu_sgl_write(&vfu_ctx, &sg, 1,
+                                         (void *)written,
+                                         VFU_SGL_DIRECT_ACCESS));
+        memset(readback, 0, sizeof(readback));
+        assert_int_equal(0, vfu_sgl_read(&vfu_ctx, &sg, 1, readback,
+                                        VFU_SGL_DIRECT_ACCESS));
+        assert_memory_equal(written, readback, sizeof(written));
+        if (modes[i] == REGION_ACCESS_MODE_MMAP) {
+            assert_int_equal(0, munmap(region->info.mapping.iov_base,
+                                       region->info.mapping.iov_len));
+            region->info.vaddr = NULL;
+        }
+        assert_int_equal(0, dma_controller_remove_region(vfu_ctx.dma,
+                                                         dma_addr, 0x1000,
+                                                         NULL, NULL));
+    }
+}
+
+static void
+test_dma_controller_add_region_truncated_replay(void **state UNUSED)
+{
+    const enum region_access_mode modes[] = {
+        REGION_ACCESS_MODE_MMAP,
+        REGION_ACCESS_MODE_FILE_IO,
+    };
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(modes); i++) {
+        char template[] = "libvfio_user_unit_tests_dma_replay_XXXXXX";
+        vfu_dma_addr_t dma_addr = (void *)(0x1000 + i * 0x2000);
+        dma_memory_region_t *region;
+        int backing_fd, fd, replay_fd;
+
+        backing_fd = mkstemp(template);
+        assert_int_not_equal(-1, backing_fd);
+        assert_int_equal(0, unlink(template));
+        assert_int_equal(0, ftruncate(backing_fd, 0x1000));
+        fd = dup(backing_fd);
+        assert_int_not_equal(-1, fd);
+
+        region = dma_controller_add_region(vfu_ctx.dma, dma_addr, 0x1000,
+                                           &fd, 0, PROT_READ | PROT_WRITE,
+                                           modes[i]);
+        assert_non_null(region);
+        assert_int_equal(-1, fd);
+
+        /* Do not access the live mapping after truncating its backing file. */
+        assert_int_equal(0, ftruncate(backing_fd, 0x800));
+        replay_fd = dup(backing_fd);
+        assert_int_not_equal(-1, replay_fd);
+        errno = 0;
+        assert_null(dma_controller_add_region(vfu_ctx.dma, dma_addr, 0x1000,
+                                              &replay_fd, 0,
+                                              PROT_READ | PROT_WRITE,
+                                              modes[i]));
+        assert_int_equal(EINVAL, errno);
+        assert_int_not_equal(-1, replay_fd);
+        assert_int_equal(1, btree_size(&vfu_ctx.dma->regions));
+
+        assert_int_equal(0, ftruncate(backing_fd, 0x1000));
+        if (modes[i] == REGION_ACCESS_MODE_MMAP) {
+            assert_int_equal(0, munmap(region->info.mapping.iov_base,
+                                       region->info.mapping.iov_len));
+            region->info.vaddr = NULL;
+        }
+        assert_int_equal(0, dma_controller_remove_region(vfu_ctx.dma,
+                                                         dma_addr, 0x1000,
+                                                         NULL, NULL));
+        assert_int_equal(0, close(replay_fd));
+        assert_int_equal(0, close(backing_fd));
+    }
+}
+
+static void
 test_dma_controller_remove_region_mapped(void **state UNUSED)
 {
     dma_memory_region_t region = {
@@ -660,11 +816,52 @@ test_should_exec_command(UNUSED void **state)
     assert_true(should_exec_command(&vfu_ctx, 0xbeef));
 }
 
+static void
+test_version_irq_clear_capability(UNUSED void **state)
+{
+    const struct {
+        const char *json;
+        int error;
+        bool supported;
+    } cases[] = {
+        { "{}", 0, false },
+        { "{\"capabilities\":{}}", 0, false },
+        { "{\"capabilities\":{\"x-msix-clear-pending\":true}}", 0, true },
+        { "{\"capabilities\":{\"x-msix-clear-pending\":false}}", 0, false },
+        { "{\"capabilities\":{\"x-msix-clear-pending\":1}}", EINVAL, false },
+        { "{\"capabilities\":{\"x-msix-clear-pending\":\"true\"}}", EINVAL, false },
+        { "{\"capabilities\":{\"x-msix-clear-pending\":null}}", EINVAL, false },
+        { "{\"capabilities\":{\"x-msix-clear-pending\":{}}}", EINVAL, false },
+        { "{\"capabilities\":{\"x-msix-clear-pending\":true", EINVAL, false },
+    };
+    int max_fds = 1;
+    size_t max_xfer = VFIO_USER_DEFAULT_MAX_DATA_XFER_SIZE, pgsize = 0;
+
+    for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+        bool twin = false, clear = false;
+        int result = tran_parse_version_json(cases[i].json, &max_fds,
+                                            &max_xfer, &pgsize, &twin, &clear);
+
+        assert_int_equal(result, cases[i].error ? -1 : 0);
+        if (cases[i].error) {
+            assert_int_equal(errno, cases[i].error);
+        }
+        assert_int_equal(clear, cases[i].supported);
+        assert_false(twin);
+    }
+
+    /* The sample client ignores the server's object-shaped reply capability. */
+    assert_int_equal(tran_parse_version_json(
+        "{\"capabilities\":{\"x-msix-clear-pending\":{\"fd_index\":0}}}",
+        &max_fds, &max_xfer, &pgsize, NULL, NULL), 0);
+}
+
 int
 main(void)
 {
     const struct CMUnitTest tests[] = {
 #define CM_TEST_ENTRY(t) cmocka_unit_test_setup_teardown(t, setup, teardown)
+        CM_TEST_ENTRY(test_version_irq_clear_capability),
         CM_TEST_ENTRY(test_dma_map_mappable_without_fd),
         CM_TEST_ENTRY(test_dma_map_without_fd),
         CM_TEST_ENTRY(test_dma_map_return_value),
@@ -672,6 +869,9 @@ main(void)
         CM_TEST_ENTRY(test_dma_controller_add_region_no_fd),
         CM_TEST_ENTRY(test_dma_controller_add_region_fd_deduplication),
         CM_TEST_ENTRY(test_dma_controller_add_region_twice),
+        CM_TEST_ENTRY(test_dma_controller_add_region_backing_extents),
+        CM_TEST_ENTRY(test_dma_controller_add_region_backing_access),
+        CM_TEST_ENTRY(test_dma_controller_add_region_truncated_replay),
         CM_TEST_ENTRY(test_dma_controller_remove_region_mapped),
         CM_TEST_ENTRY(test_dma_controller_remove_region_unmapped),
         CM_TEST_ENTRY(test_dma_addr_to_sgl),

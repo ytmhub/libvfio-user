@@ -70,7 +70,7 @@
 int
 tran_parse_version_json(const char *json_str, int *client_max_fdsp,
                         size_t *client_max_data_xfer_sizep, size_t *pgsizep,
-                        bool *twin_socket_supportedp)
+                        bool *twin_socket_supportedp, bool *irq_clear_supportedp)
 {
     struct json_object *jo_caps = NULL;
     struct json_object *jo_top = NULL;
@@ -157,6 +157,16 @@ tran_parse_version_json(const char *json_str, int *client_max_fdsp,
         }
     }
 
+    /* Private, opt-in reset-token channel, independent of synchronous VFIO I/O.
+     * NULL lets clients ignore the differently shaped server reply capability. */
+    if (irq_clear_supportedp != NULL &&
+        json_object_object_get_ex(jo_caps, "x-msix-clear-pending", &jo)) {
+        if (json_object_get_type(jo) != json_type_boolean) {
+            goto out;
+        }
+        *irq_clear_supportedp = json_object_get_boolean(jo);
+    }
+
     ret = 0;
 
 out:
@@ -221,6 +231,7 @@ recv_version(vfu_ctx_t *vfu_ctx, uint16_t *msg_idp,
 
     vfu_ctx->client_max_fds = 1;
     vfu_ctx->client_max_data_xfer_size = VFIO_USER_DEFAULT_MAX_DATA_XFER_SIZE;
+    vfu_ctx->client_irq_clear = false;
 
     if (msg.in.iov.iov_len > sizeof(*cversion)) {
         const char *json_str = (const char *)cversion->data;
@@ -235,7 +246,8 @@ recv_version(vfu_ctx_t *vfu_ctx, uint16_t *msg_idp,
 
         ret = tran_parse_version_json(json_str, &vfu_ctx->client_max_fds,
                                       &vfu_ctx->client_max_data_xfer_size,
-                                      &pgsize, twin_socket_supportedp);
+                                      &pgsize, twin_socket_supportedp,
+                                      &vfu_ctx->client_irq_clear);
 
         if (ret < 0) {
             /* No client-supplied strings in the log for release build. */
@@ -339,7 +351,8 @@ json_add_uint64(struct json_object *jso, const char *key, uint64_t value)
  * be freed by the caller.
  */
 static char *
-format_server_capabilities(vfu_ctx_t *vfu_ctx, int twin_socket_fd_index)
+format_server_capabilities(vfu_ctx_t *vfu_ctx, int twin_socket_fd_index,
+                           int irq_clear_fd_index)
 {
     struct json_object *jo_twin_socket = NULL;
     struct json_object *jo_migration = NULL;
@@ -394,6 +407,16 @@ format_server_capabilities(vfu_ctx_t *vfu_ctx, int twin_socket_fd_index)
         }
     }
 
+    if (irq_clear_fd_index >= 0) {
+        struct json_object *channel = json_object_new_object();
+        if (channel == NULL ||
+            json_add_uint64(channel, "fd_index", irq_clear_fd_index) < 0) {
+            json_object_put(channel);
+            goto out;
+        }
+        if (json_add(jo_caps, "x-msix-clear-pending", &channel) < 0) goto out;
+    }
+
     if ((jo_top = json_object_new_object()) == NULL ||
         json_add(jo_top, "capabilities", &jo_caps) < 0) {
         goto out;
@@ -411,16 +434,24 @@ out:
 
 static int
 send_version(vfu_ctx_t *vfu_ctx, uint16_t msg_id,
-             struct vfio_user_version *cversion, int client_cmd_socket_fd)
+             struct vfio_user_version *cversion, int client_cmd_socket_fd,
+             int irq_clear_fd)
 {
     int twin_socket_fd_index = client_cmd_socket_fd >= 0 ? 0 : -1;
+    int fds[2], nr_fds = 0, irq_clear_fd_index = -1;
     struct vfio_user_version sversion = { 0 };
     struct iovec iovecs[2] = { { 0 } };
     vfu_msg_t msg = { { 0 } };
     char *server_caps = NULL;
     int ret;
 
-    server_caps = format_server_capabilities(vfu_ctx, twin_socket_fd_index);
+    if (client_cmd_socket_fd >= 0) fds[nr_fds++] = client_cmd_socket_fd;
+    if (irq_clear_fd >= 0) {
+        irq_clear_fd_index = nr_fds;
+        fds[nr_fds++] = irq_clear_fd;
+    }
+    server_caps = format_server_capabilities(vfu_ctx, twin_socket_fd_index,
+                                              irq_clear_fd_index);
     if (server_caps == NULL) {
         errno = ENOMEM;
         return -1;
@@ -441,11 +472,8 @@ send_version(vfu_ctx_t *vfu_ctx, uint16_t msg_id,
     msg.hdr.msg_id = msg_id;
     msg.out_iovecs = iovecs;
     msg.nr_out_iovecs = 2;
-    if (client_cmd_socket_fd >= 0) {
-        msg.out.fds = &client_cmd_socket_fd;
-        msg.out.nr_fds = 1;
-        assert(msg.out.fds[twin_socket_fd_index] == client_cmd_socket_fd);
-    }
+    msg.out.fds = fds;
+    msg.out.nr_fds = nr_fds;
 
     ret = vfu_ctx->tran->reply(vfu_ctx, &msg, 0);
     free(server_caps);
@@ -457,6 +485,7 @@ tran_negotiate(vfu_ctx_t *vfu_ctx, int *client_cmd_socket_fdp)
 {
     struct vfio_user_version *client_version = NULL;
     int client_cmd_socket_fds[2] = { -1, -1 };
+    int irq_clear_fds[2] = { -1, -1 };
     bool twin_socket_supported = false;
     uint16_t msg_id = 0x0bad;
     int ret;
@@ -479,8 +508,18 @@ tran_negotiate(vfu_ctx_t *vfu_ctx, int *client_cmd_socket_fdp)
         }
     }
 
+    if (vfu_ctx->client_irq_clear && client_cmd_socket_fdp != NULL &&
+        vfu_ctx->client_max_fds > (client_cmd_socket_fds[0] >= 0 ? 1 : 0)) {
+        if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK,
+                       0, irq_clear_fds) < 0) {
+            close_safely(&client_cmd_socket_fds[0]);
+            close_safely(&client_cmd_socket_fds[1]);
+            free(client_version);
+            return -1;
+        }
+    }
     ret = send_version(vfu_ctx, msg_id, client_version,
-                       client_cmd_socket_fds[0]);
+                       client_cmd_socket_fds[0], irq_clear_fds[0]);
 
     free(client_version);
 
@@ -489,11 +528,18 @@ tran_negotiate(vfu_ctx_t *vfu_ctx, int *client_cmd_socket_fdp)
      * The local end is kept only if passed to the caller on successful return.
      */
     close_safely(&client_cmd_socket_fds[0]);
+    close_safely(&irq_clear_fds[0]);
     if (ret < 0) {
         vfu_log(vfu_ctx, LOG_ERR, "failed to send version: %m");
         close_safely(&client_cmd_socket_fds[1]);
+        close_safely(&irq_clear_fds[1]);
     } else if (client_cmd_socket_fdp != NULL) {
         *client_cmd_socket_fdp = client_cmd_socket_fds[1];
+    }
+    if (ret >= 0) {
+        vfu_ctx->irq_clear_fd = irq_clear_fds[1];
+        vfu_ctx->irq_clear_serial = 0;
+        vfu_ctx->irq_clear_waiting = false;
     }
 
     return ret;

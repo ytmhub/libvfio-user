@@ -861,6 +861,8 @@ tran_sock_detach(vfu_ctx_t *vfu_ctx)
     if (ts != NULL) {
         close_safely(&ts->conn_fd);
         close_safely(&ts->client_cmd_socket_fd);
+        close_safely(&vfu_ctx->irq_clear_fd);
+        vfu_ctx->irq_clear_waiting = false;
     }
 }
 

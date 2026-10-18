@@ -173,6 +173,10 @@ struct vfu_ctx {
 
     int                     client_max_fds;
     size_t                  client_max_data_xfer_size;
+    bool                    client_irq_clear;
+    int                     irq_clear_fd;
+    uint64_t                irq_clear_serial;
+    bool                    irq_clear_waiting;
 
     struct vfu_ctx_pending_info pending;
     bool                    quiesced;

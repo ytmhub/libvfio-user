@@ -672,6 +672,15 @@ vfu_setup_device_migration_callbacks(vfu_ctx_t *vfu_ctx,
 int
 vfu_irq_trigger(vfu_ctx_t *vfu_ctx, uint32_t subindex);
 
+/* Private negotiated x-msix-clear-pending channel. Clear client-held pending
+ * MSI-X signals asynchronously: 0 only after exact acknowledgement, -1/EAGAIN
+ * while waiting, -1/ENOTSUP without negotiation. The caller must stop issuing
+ * IRQs until completion and keep servicing normal VFIO traffic. No DMA maps,
+ * vector eventfds, table entries or already-delivered guest IRQs are changed.
+ * Poll the returned FD for readability and call again to progress. */
+int vfu_irq_clear_pending(vfu_ctx_t *vfu_ctx);
+int vfu_irq_clear_pending_fd(vfu_ctx_t *vfu_ctx);
+
 /**
  * Takes a guest physical address range and populates an array of scatter/gather
  * entries than can be individually mapped in the program's virtual memory.  A

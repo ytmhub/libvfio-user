@@ -67,6 +67,31 @@ fd_get_blocksize(int fd)
 }
 
 static int
+fd_validate_extent(int fd, off_t offset, uint64_t size)
+{
+    struct stat st;
+
+    if (offset < 0) {
+        return ERROR_INT(EINVAL);
+    }
+
+    if (fstat(fd, &st) != 0) {
+        return -1;
+    }
+
+    /*
+     * Compare by subtraction so that the requested end offset is never
+     * computed in either off_t or uint64_t. Besides detecting a span beyond
+     * EOF, this also rejects spans whose end would overflow off_t.
+     */
+    if (st.st_size < offset || size > (uint64_t)(st.st_size - offset)) {
+        return ERROR_INT(EINVAL);
+    }
+
+    return 0;
+}
+
+static int
 dirty_page_logging_start_on_region(dma_memory_region_t *region, size_t pgsize)
 {
     assert(region->access_mode != REGION_ACCESS_MODE_MSG);
@@ -312,6 +337,14 @@ MOCK_DEFINE(dma_controller_add_region)(dma_controller_t *dma,
         vfu_log(dma->vfu_ctx, LOG_ERR, "DMA region size %llu > max %zu",
                 (unsigned long long)size, dma->max_size);
         return ERROR_PTR(ENOSPC);
+    }
+
+    if (access_mode != REGION_ACCESS_MODE_MSG &&
+        fd_validate_extent(*fd, offset, size) != 0) {
+        vfu_log(dma->vfu_ctx, LOG_ERR,
+                "DMA region backing file is too small or invalid %s: %m",
+                rstr);
+        return NULL;
     }
 
     btree_iter_init(&dma->regions, (uintptr_t)dma_addr, &iter);

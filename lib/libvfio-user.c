@@ -1949,6 +1949,7 @@ vfu_create_ctx(vfu_trans_t trans, const char *path, int flags, void *pvt,
     if (vfu_ctx == NULL) {
         return NULL;
     }
+    vfu_ctx->irq_clear_fd = -1;
 
     vfu_ctx->dev_type = dev_type;
     if (trans == VFU_TRANS_SOCK) {

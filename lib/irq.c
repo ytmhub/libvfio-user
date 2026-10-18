@@ -34,11 +34,55 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <endian.h>
 
 #include "irq.h"
 
 #define LM2VFIO_IRQT(type) (type - 1)
+
+EXPORT int
+vfu_irq_clear_pending_fd(vfu_ctx_t *vfu_ctx)
+{
+    return vfu_ctx->irq_clear_fd;
+}
+
+EXPORT int
+vfu_irq_clear_pending(vfu_ctx_t *vfu_ctx)
+{
+    uint64_t token;
+    uint8_t reply[sizeof(token) + 1];
+    ssize_t count;
+    int saved;
+
+    if (vfu_ctx->irq_clear_fd < 0) return ERROR_INT(ENOTSUP);
+    if (!vfu_ctx->irq_clear_waiting) {
+        if (vfu_ctx->irq_clear_serial == UINT64_MAX) return ERROR_INT(EOVERFLOW);
+        token = htole64(vfu_ctx->irq_clear_serial + 1);
+        count = send(vfu_ctx->irq_clear_fd, &token, sizeof(token), MSG_NOSIGNAL);
+        if (count < 0 && (errno == EAGAIN || errno == EINTR)) return -1;
+        if (count != sizeof(token)) {
+            if (count >= 0) errno = EPROTO;
+            goto failed;
+        }
+        ++vfu_ctx->irq_clear_serial;
+        vfu_ctx->irq_clear_waiting = true;
+    }
+    count = recv(vfu_ctx->irq_clear_fd, reply, sizeof(reply), 0);
+    if (count < 0 && (errno == EAGAIN || errno == EINTR)) return ERROR_INT(EAGAIN);
+    token = htole64(vfu_ctx->irq_clear_serial);
+    if (count == sizeof(token) && memcmp(reply, &token, sizeof(token)) == 0) {
+        vfu_ctx->irq_clear_waiting = false;
+        return 0;
+    }
+    if (count >= 0) errno = count == 0 ? ECONNRESET : EPROTO;
+failed:
+    saved = errno;
+    close_safely(&vfu_ctx->irq_clear_fd);
+    return ERROR_INT(saved);
+}
 
 static const char *
 vfio_irq_idx_to_str(int index)

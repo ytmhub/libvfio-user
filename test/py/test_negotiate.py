@@ -29,6 +29,10 @@
 
 from libvfio_user import *
 import errno
+import json as json_module
+import os
+import pytest
+import socket
 import struct
 
 ctx = None
@@ -123,6 +127,11 @@ def test_invalid_json_missing_closing_quote():
     client_version_json(errno.EINVAL, b'"')
 
 
+def test_invalid_json_truncated_irq_clear_capability():
+    client_version_json(errno.EINVAL,
+                        b'{"capabilities":{"x-msix-clear-pending":true')
+
+
 def test_invalid_json_bad_capabilities_object():
     client_version_json(errno.EINVAL, b'{ "capabilities": "23" }')
 
@@ -199,5 +208,87 @@ def test_valid_negotiate_json():
 
 def test_destroying():
     vfu_destroy_ctx(ctx)
+
+
+@pytest.mark.parametrize("twin", [False, True])
+@pytest.mark.parametrize("clear", [None, False, True],
+                         ids=["absent", "false", "true"])
+@pytest.mark.parametrize("max_fds", [None, 0, 1, 2],
+                         ids=["default-fds", "zero-fds", "one-fd", "two-fds"])
+def test_irq_clear_negotiated_fds(twin, clear, max_fds):
+    local_ctx = vfu_create_ctx()
+    sock = None
+    received_fds = []
+    try:
+        assert vfu_realize_ctx(local_ctx) == 0
+        sock = connect_sock()
+        caps = {"twin_socket": {"supported": twin}}
+        if clear is not None:
+            caps["x-msix-clear-pending"] = clear
+        if max_fds is not None:
+            caps["max_msg_fds"] = max_fds
+        encoded = json_module.dumps({"capabilities": caps}).encode() + b'\0'
+        payload = struct.pack("HH", LIBVFIO_USER_MAJOR,
+                              LIBVFIO_USER_MINOR) + encoded
+        sock.sendall(vfio_user_header(VFIO_USER_VERSION,
+                                     size=len(payload)) + payload)
+        vfu_attach_ctx(local_ctx)
+        received_fds, payload = get_reply_fds(sock)
+        reply = json_module.loads(payload[4:-1])["capabilities"]
+        limit = 1 if max_fds is None else max_fds
+        expect_twin = twin and limit > 0
+        expect_clear = clear is True and limit > int(expect_twin)
+        assert len(received_fds) == int(expect_twin) + int(expect_clear)
+        assert ("twin_socket" in reply) == expect_twin
+        assert ("x-msix-clear-pending" in reply) == expect_clear
+        for name, enabled, index, sock_type in [
+            ("twin_socket", expect_twin, 0, socket.SOCK_STREAM),
+            ("x-msix-clear-pending", expect_clear, int(expect_twin),
+             socket.SOCK_SEQPACKET),
+        ]:
+            if enabled:
+                expected = {"fd_index": index}
+                if name == "twin_socket":
+                    expected["supported"] = True
+                assert reply[name] == expected
+                with socket.fromfd(received_fds[index], socket.AF_UNIX,
+                                   sock_type) as channel:
+                    assert channel.getsockopt(socket.SOL_SOCKET,
+                                              socket.SO_TYPE) == sock_type
+    finally:
+        for fd in received_fds:
+            os.close(fd)
+        if sock is not None:
+            sock.close()
+        vfu_destroy_ctx(local_ctx)
+
+
+@pytest.mark.parametrize("twin", [False, True])
+@pytest.mark.parametrize("value", [1, "true", None, {}, []])
+def test_invalid_irq_clear_capability(twin, value):
+    local_ctx = vfu_create_ctx()
+    sock = None
+    try:
+        assert vfu_realize_ctx(local_ctx) == 0
+        sock = connect_sock()
+        encoded = json_module.dumps({"capabilities": {
+            "twin_socket": {"supported": twin},
+            "x-msix-clear-pending": value,
+        }}).encode() + b'\0'
+        payload = struct.pack("HH", LIBVFIO_USER_MAJOR,
+                              LIBVFIO_USER_MINOR) + encoded
+        sock.sendall(vfio_user_header(VFIO_USER_VERSION,
+                                     size=len(payload)) + payload)
+        vfu_attach_ctx(local_ctx, expect=errno.EINVAL)
+        received_fds, _ = get_reply_fds(sock, expect=errno.EINVAL)
+        try:
+            assert received_fds == []
+        finally:
+            for fd in received_fds:
+                os.close(fd)
+    finally:
+        if sock is not None:
+            sock.close()
+        vfu_destroy_ctx(local_ctx)
 
 # ex: set tabstop=4 shiftwidth=4 softtabstop=4 expandtab:
